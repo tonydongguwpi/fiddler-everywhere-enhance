@@ -1,67 +1,97 @@
-name: Build and Package Fiddler
+name: Fiddler Build & Release
 
 on:
-  workflow_dispatch: # 允许手动触发
+  release:
+    types: [published]
   push:
+    tags:        
+      - v*
+    branches: [ main, dev, mac]
+  pull_request:
     branches: [ main ]
+  workflow_dispatch:  # 启用手动触发
 
 jobs:
-  package-fiddler:
+  build-app:
+    name: Build and Package Fiddler
     runs-on: macos-latest
-    timeout-minutes: 15
+    timeout-minutes: 15  # 增加超时时间
+
+    strategy:
+      matrix:
+        node-version: [16.x]
+        ARCH: ['x64']
 
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v2
+        with:
+          submodules: 'recursive'
+      
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v2
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v3
-      with:
-        node-version: 16.x
+      - name: Patch Fiddler
+        run: |
+          # 下载并挂载原版Fiddler
+          wget https://downloads.getfiddler.com/mac-arm64/Fiddler%20Everywhere%206.0.0.dmg -O fiddler.dmg
+          yes y | hdiutil attach fiddler.dmg -mountpoint "/Volumes/fiddler"
+          mkdir -p patched-app
+          cp -R "/Volumes/fiddler/Fiddler Everywhere.app" patched-app/
+          hdiutil detach "/Volumes/fiddler"
 
-    - name: Download and patch Fiddler
-      run: |
-        # 1. 下载官方Fiddler
-        wget https://downloads.getfiddler.com/mac-arm64/Fiddler%20Everywhere%206.0.0.dmg -O fiddler.dmg
-        
-        # 2. 挂载DMG并复制文件
-        hdiutil attach fiddler.dmg -mountpoint /Volumes/fiddler -nobrowse
-        mkdir -p fiddler-app
-        cp -R /Volumes/fiddler/Fiddler\ Everywhere.app fiddler-app/
-        hdiutil detach /Volumes/fiddler
+          # 应用补丁
+          cd "patched-app/Fiddler Everywhere.app/Contents"
+          cd Frameworks
+          rm -f libfiddler.dylib
+          wget https://github.com/project-yui/Yui-patch/releases/download/v1.1.3/yui-fiddler-mac-arm64-v1.1.3.dylib -O libfiddler.dylib
+          chmod +x libfiddler.dylib
+          
+          # 修改主程序
+          cd ..
+          mv Resources/app/out/main.js Resources/app/out/main.original.js
+          cat ../../../server/index.js > Resources/app/out/main.js
+          cat Resources/app/out/main.original.js >> Resources/app/out/main.js
+          cp -R ../../../server/file Resources/app/out
 
-        # 3. 应用补丁
-        cd fiddler-app/Fiddler\ Everywhere.app/Contents
-        rm Frameworks/libfiddler.dylib
-        wget https://example.com/patches/libfiddler-patched.dylib -O Frameworks/libfiddler.dylib
-        
-        # 4. 修改主程序
-        mv Resources/app/out/main.js Resources/app/out/main.original.js
-        cat << 'EOF' > Resources/app/out/main.js
-        // 自定义破解代码
-        require('./main.original.js');
-        EOF
+      - name: Create ZIP package
+        run: |
+          cd patched-app
+          zip -r ../fiddler-patched.zip "Fiddler Everywhere.app"
+          cd ..
+          echo "PACKAGE_SIZE=$(du -h fiddler-patched.zip | cut -f1)" >> $GITHUB_ENV
 
-    - name: Zip modified app
-      run: |
-        cd fiddler-app
-        zip -r ../fiddler-patched.zip "Fiddler Everywhere.app"
-        cd ..
-        echo "ZIP_SIZE=$(du -h fiddler-patched.zip | cut -f1)" >> $GITHUB_ENV
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: fiddler-patched
+          path: fiddler-patched.zip
+          retention-days: 7
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v3
-      with:
-        name: fiddler-patched
-        path: fiddler-patched.zip
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && contains(github.ref, 'tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: fiddler-patched.zip
+          tag_name: ${{ github.ref }}
+          body: |
+            ### 破解版 Fiddler Everywhere
+            - 版本: 6.0.0 (patched)
+            - 平台: macOS
+            - 文件大小: ${{ env.PACKAGE_SIZE }}
+            - SHA256: $(shasum -a 256 fiddler-patched.zip | cut -d ' ' -f1)
+          draft: false
+          prerelease: false
 
-    - name: Create release
-      uses: softprops/action-gh-release@v1
-      if: github.ref == 'refs/heads/main'
-      with:
-        files: fiddler-patched.zip
-        generate_release_notes: true
-        body: |
-          ### 破解版 Fiddler Everywhere
-          - 版本: 6.0.0
-          - 平台: macOS ARM64
-          - 文件大小: ${{ env.ZIP_SIZE }}
+      - name: Generate direct download link
+        if: always()
+        run: |
+          # 生成临时下载链接 (通过artifact)
+          echo "Artifact download URL:"
+          echo "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          
+          # 如果是Release则会自动生成永久链接
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+            echo "Release download URL:"
+            echo "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/fiddler-patched.zip"
+          fi
